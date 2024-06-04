@@ -1,9 +1,25 @@
-use anyhow::{Context as _, Result};
+use anyhow::{Context, Result};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn handle_connection(_stream: TcpStream) -> Result<()> {
-    println!("handled new connection");
-    Ok(())
+const CRLF: &[u8] = b"\r\n";
+
+async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+    let (_reader, writer) = stream.split();
+    let mut writer = BufWriter::new(writer);
+
+    // status
+    let status = b"HTTP/1.1 200 OK";
+
+    writer.write_all(status).await.context("status")?;
+    writer.write_all(CRLF).await.context("status end")?;
+
+    // headers
+    writer.write_all(CRLF).await.context("headers end")?;
+
+    // body
+
+    writer.flush().await.context("flush response")
 }
 
 #[tokio::main]

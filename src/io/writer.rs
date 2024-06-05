@@ -2,6 +2,7 @@ use std::io::{Cursor, Write as _};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use tokio::fs::File;
 use tokio::io::{self, AsyncWriteExt, BufWriter};
 
 use crate::body::Body;
@@ -83,5 +84,31 @@ where
         }
 
         self.writer.flush().await.context("flush")
+    }
+}
+
+#[repr(transparent)]
+pub struct FileWriter(BufWriter<File>);
+
+impl FileWriter {
+    #[inline]
+    pub fn new(file: File) -> Self {
+        Self(BufWriter::new(file))
+    }
+
+    pub async fn write(&mut self, body: Body) -> io::Result<u64> {
+        let n = match body {
+            Body::Bytes(bytes) => {
+                let mut reader = io::BufReader::new(Cursor::new(bytes));
+                io::copy_buf(&mut reader, &mut self.0).await?
+            }
+            Body::File(file) => {
+                let mut reader = file.into_reader();
+                io::copy_buf(&mut reader, &mut self.0).await?
+            }
+        };
+
+        self.0.flush().await?;
+        Ok(n)
     }
 }

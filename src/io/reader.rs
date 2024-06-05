@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::header::{HeaderMap, CONTENT_LENGTH};
 use crate::io::CRLF;
-use crate::{Body, Request};
+use crate::{Body, Method, Request};
 
 pub struct RequestReader<R> {
     reader: BufReader<R>,
@@ -46,8 +46,10 @@ where
         let mut req_line = buf.split_to(n - 2);
         let _ = buf.split_to(2);
 
+        let method = freeze_to_whitespace(&mut req_line);
+
         Ok(RequestLine {
-            method: freeze_to_whitespace(&mut req_line),
+            method: Method::try_from(method).context("invalid method")?,
             target: freeze_to_whitespace(&mut req_line),
             version: freeze_to_whitespace(&mut req_line),
         })
@@ -133,7 +135,7 @@ where
 
 #[derive(Debug)]
 struct RequestLine {
-    method: Bytes,
+    method: Method,
     target: Bytes,
     version: Bytes,
 }

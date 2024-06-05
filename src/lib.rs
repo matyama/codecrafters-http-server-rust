@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use header::{CONTENT_LENGTH, CONTENT_TYPE, TEXT_PLAIN};
 use tokio::fs;
@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 
 use crate::body::Body;
 use crate::header::{HeaderMap, OCTET_STREAM};
-use crate::io::{RequestReader, ResponseWriter};
+use crate::io::{FileWriter, RequestReader, ResponseWriter};
 
 pub use config::Config;
 
@@ -20,15 +20,40 @@ pub(crate) mod config;
 pub(crate) mod header;
 pub(crate) mod io;
 
+// TODO: other methods
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+}
+
+impl TryFrom<Bytes> for Method {
+    type Error = anyhow::Error;
+
+    #[inline]
+    fn try_from(method: Bytes) -> Result<Self, Self::Error> {
+        match method.as_ref() {
+            b"GET" => Ok(Self::Get),
+            b"POST" => Ok(Self::Post),
+            _ => bail!("unknown method '{}'", String::from_utf8_lossy(&method)),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Request {
-    // TODO: method as an enum
-    method: Bytes,
+    method: Method,
     target: Bytes,
     version: Bytes,
     headers: HeaderMap,
     body: Body,
+}
+
+macro_rules! status_code {
+    ($name:ident,$code:literal) => {
+        pub const $name: StatusCode = StatusCode(unsafe { NonZeroU16::new_unchecked($code) });
+    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,10 +61,11 @@ pub struct Request {
 pub struct StatusCode(NonZeroU16);
 
 impl StatusCode {
-    pub const OK: StatusCode = StatusCode(unsafe { NonZeroU16::new_unchecked(200) });
-    pub const NOT_FOUND: StatusCode = StatusCode(unsafe { NonZeroU16::new_unchecked(404) });
-    pub const INTERNAL_SERVER_ERROR: StatusCode =
-        StatusCode(unsafe { NonZeroU16::new_unchecked(500) });
+    status_code!(OK, 200);
+    status_code!(CREATED, 201);
+    status_code!(BAD_REQUEST, 400);
+    status_code!(NOT_FOUND, 404);
+    status_code!(INTERNAL_SERVER_ERROR, 500);
 
     #[inline]
     pub fn as_u16(&self) -> u16 {
@@ -51,6 +77,8 @@ impl StatusCode {
     pub fn as_str(&self) -> &str {
         match self.as_u16() {
             200 => "OK",
+            201 => "Created",
+            400 => "Bad Request",
             404 => "Not Found",
             500 => "Internal Server Error",
             code => unimplemented!("string representation of {code:?}"),
@@ -192,21 +220,29 @@ pub async fn handle_connection(mut stream: TcpStream, cfg: &Config) -> Result<()
             },
         ),
 
-        url if url.starts_with(b"/files/") => {
+        url if url.starts_with(b"/files") => {
             let file = url
                 .strip_prefix(b"/files/")
+                .filter(|f| !f.is_empty())
                 .and_then(|f| std::str::from_utf8(f).map(Path::new).ok())
                 .map(|f| cfg.files_dir().join(f));
 
-            match file {
-                Some(file) if file.exists() && file.is_file() => {
+            match (req.method, file) {
+                (Method::Get, Some(file)) if file.is_file() => {
                     Response::from_request(&req)
                         .status(StatusCode::OK)
                         .file(file)
                         .await
                 }
-                _ => Response::from_request(&req)
+
+                (Method::Get, _) => Response::from_request(&req)
                     .status(StatusCode::NOT_FOUND)
+                    .build(),
+
+                (Method::Post, Some(file)) => upload_file(file, req).await,
+
+                (Method::Post, None) => Response::from_request(&req)
+                    .status(StatusCode::BAD_REQUEST)
                     .build(),
             }
         }
@@ -227,4 +263,31 @@ pub async fn handle_connection(mut stream: TcpStream, cfg: &Config) -> Result<()
     println!("{resp:?}");
 
     writer.write_response(resp).await.context("write response")
+}
+
+async fn upload_file(file: PathBuf, req: Request) -> Response {
+    let resp = Response::from_request(&req);
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(file)
+        .await;
+
+    let mut file = match file {
+        Ok(file) => FileWriter::new(file),
+        Err(_) => return resp.status(StatusCode::INTERNAL_SERVER_ERROR).empty(),
+    };
+
+    let bytes_read = req.body.content_length();
+
+    // TODO: stream body from the request based on Content-Type (i.e., don't materialize in memory)
+    let Ok(bytes_written) = file.write(req.body).await else {
+        return resp.status(StatusCode::INTERNAL_SERVER_ERROR).empty();
+    };
+
+    debug_assert_eq!(bytes_read, bytes_written, "corrupted file upload");
+
+    resp.status(StatusCode::CREATED).build()
 }

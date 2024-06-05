@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::num::NonZeroU16;
 
 use anyhow::{Context as _, Result};
 use bytes::{Bytes, BytesMut};
+use header::{CONTENT_LENGTH, CONTENT_TYPE, TEXT_PLAIN};
 use tokio::net::TcpStream;
 
 use crate::header::HeaderMap;
@@ -34,6 +36,17 @@ impl From<BytesMut> for Body {
     #[inline]
     fn from(bytes: BytesMut) -> Self {
         Self(bytes.freeze())
+    }
+}
+
+impl From<&[u8]> for Body {
+    #[inline]
+    fn from(bytes: &[u8]) -> Self {
+        if bytes.is_empty() {
+            Self::default()
+        } else {
+            Self::from(Bytes::copy_from_slice(bytes))
+        }
     }
 }
 
@@ -83,8 +96,7 @@ impl Default for StatusCode {
 pub struct Response {
     pub(crate) version: Bytes,
     pub(crate) status: StatusCode,
-    // TODO: include headers with at least to Content-Length of the body
-    // headers: HeaderMap,
+    pub(crate) headers: HeaderMap,
     pub(crate) body: Body,
 }
 
@@ -94,6 +106,7 @@ impl Response {
         ResponseBuilder {
             version: request.version.clone(),
             status: StatusCode::default(),
+            headers: HashMap::new(),
             body: BytesMut::new(),
         }
     }
@@ -103,6 +116,7 @@ impl Response {
 pub struct ResponseBuilder {
     version: Bytes,
     status: StatusCode,
+    headers: HashMap<Bytes, Bytes>,
     body: BytesMut,
 }
 
@@ -113,22 +127,41 @@ impl ResponseBuilder {
         self
     }
 
-    #[inline]
-    pub fn body(self, body: impl Into<Body>) -> Response {
+    pub fn header(mut self, name: Bytes, value: Bytes) -> Self {
+        self.headers.insert(name, value);
+        self
+    }
+
+    fn build_response(
+        version: Bytes,
+        status: StatusCode,
+        mut headers: HashMap<Bytes, Bytes>,
+        body: Body,
+    ) -> Response {
+        // insert/overwrite with the final content length
+        let content_length = match body.len() {
+            0 => Bytes::from_static(b"0"),
+            len => len.to_string().into(),
+        };
+        headers.insert(CONTENT_LENGTH, content_length);
+
         Response {
-            version: self.version,
-            status: self.status,
-            body: body.into(),
+            version,
+            status,
+            headers: HeaderMap::from_iter(headers),
+            body,
         }
     }
 
     #[inline]
+    pub fn text_plain(mut self, body: impl Into<Body>) -> Response {
+        self = self.header(CONTENT_TYPE, TEXT_PLAIN);
+        Self::build_response(self.version, self.status, self.headers, body.into())
+    }
+
+    #[inline]
     pub fn build(self) -> Response {
-        Response {
-            version: self.version,
-            status: self.status,
-            body: self.body.into(),
-        }
+        Self::build_response(self.version, self.status, self.headers, self.body.into())
     }
 }
 
@@ -142,9 +175,18 @@ pub async fn handle_connection(mut stream: TcpStream) -> Result<()> {
 
     println!("{req:?}");
 
-    // TODO: extract to router
+    // TODO: extract to a router and magic handlers
     let resp = match req.target.as_ref() {
         b"/" => Response::from_request(&req).status(StatusCode::OK).build(),
+
+        url if url.starts_with(b"/echo") => {
+            let msg = url.strip_prefix(b"/echo/").unwrap_or_default();
+
+            Response::from_request(&req)
+                .status(StatusCode::OK)
+                .text_plain(msg)
+        }
+
         _ => Response::from_request(&req)
             .status(StatusCode::NOT_FOUND)
             .build(),

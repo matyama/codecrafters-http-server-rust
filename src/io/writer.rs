@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
+use crate::header::HeaderMap;
 use crate::io::CRLF;
 use crate::{Response, StatusCode};
 
@@ -39,7 +40,21 @@ where
             .await
             .context("status text")?;
 
+        self.writer.write_all(CRLF).await.context("status end")
+    }
+
+    async fn write_header(&mut self, name: Bytes, value: Bytes) -> Result<()> {
+        self.writer.write_all(&name).await.context("name")?;
+        self.writer.write_all(b": ").await.context("separator")?;
+        self.writer.write_all(&value).await.context("value")?;
         self.writer.write_all(CRLF).await.context("end")
+    }
+
+    async fn write_haaders(&mut self, headers: HeaderMap) -> Result<()> {
+        for (name, value) in headers.iter() {
+            self.write_header(name, value).await?;
+        }
+        self.writer.write_all(CRLF).await.context("headers end")
     }
 
     pub async fn write_response(&mut self, response: Response) -> Result<()> {
@@ -47,8 +62,9 @@ where
             .await
             .context("status line")?;
 
-        // TODO: headers
-        self.writer.write_all(CRLF).await.context("headers end")?;
+        self.write_haaders(response.headers)
+            .await
+            .context("headers")?;
 
         if !response.body.is_empty() {
             self.writer

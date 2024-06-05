@@ -2,17 +2,33 @@ use std::{str::FromStr, sync::Arc};
 
 use bytes::Bytes;
 
+pub const CONTENT_TYPE: Bytes = Bytes::from_static(b"Content-Type");
 pub const CONTENT_LENGTH: Bytes = Bytes::from_static(b"Content-Length");
+
+pub const TEXT_PLAIN: Bytes = Bytes::from_static(b"text/plain");
 
 // TODO: ideally some persistent map (immutable, with structural sharing)
 #[derive(Clone, Debug)]
 #[repr(transparent)]
-pub(crate) struct HeaderMap(Arc<[(Bytes, Bytes)]>);
+pub struct HeaderMap(Arc<[(Bytes, Bytes)]>);
 
 impl HeaderMap {
+    #[inline]
+    pub fn from_iter(iter: impl IntoIterator<Item = (Bytes, Bytes)>) -> Self {
+        Self(iter.into_iter().collect())
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (Bytes, Bytes)> + '_ {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+    }
+
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Bytes> {
         let key = key.as_ref();
         self.0.iter().find_map(|(name, value)| {
+            // FIXME: header name is case-insensitive
             if name.as_ref() == key {
                 Some(value.clone())
             } else {
@@ -40,7 +56,7 @@ impl HeaderMap {
 
 #[derive(Debug, Default)]
 #[repr(transparent)]
-pub(crate) struct HeaderMapBuilder(Vec<(Bytes, Bytes)>);
+pub struct HeaderMapBuilder(Vec<(Bytes, Bytes)>);
 
 impl HeaderMapBuilder {
     // TODO: handle duplicate headers

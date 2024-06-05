@@ -10,7 +10,7 @@ use tokio::fs;
 use tokio::net::TcpStream;
 
 use crate::body::Body;
-use crate::header::{HeaderMap, OCTET_STREAM};
+use crate::header::{AcceptEncoding, HeaderMap, CONTENT_ENCODING, OCTET_STREAM};
 use crate::io::{FileWriter, RequestReader, ResponseWriter};
 
 pub use config::Config;
@@ -19,6 +19,63 @@ pub(crate) mod body;
 pub(crate) mod config;
 pub(crate) mod header;
 pub(crate) mod io;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Encoding {
+    Gzip,
+    Compress,
+    Deflate,
+    Br,
+    Zstd,
+}
+
+macro_rules! encoding {
+    ($($var:ident($name:ident, $enc:literal)),+) => {
+        impl Encoding {
+            $(pub const $name: Bytes = Bytes::from_static($enc);)+
+        }
+
+        impl TryFrom<&[u8]> for Encoding {
+            type Error = anyhow::Error;
+
+            #[inline]
+            fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+                match bytes {
+                    $($enc => Ok(Self::$var),)+
+                    other => bail!("unsupported encoding '{}'", String::from_utf8_lossy(other)),
+                }
+            }
+        }
+
+        impl From<Encoding> for Bytes {
+            #[inline]
+            fn from(encoding: Encoding) -> Self {
+                match encoding {
+                    $(Encoding::$var => Encoding::$name,)+
+                }
+            }
+        }
+    };
+}
+
+impl TryFrom<Bytes> for Encoding {
+    type Error = anyhow::Error;
+
+    #[inline]
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        Self::try_from(bytes.as_ref())
+    }
+}
+
+// TODO: support * and quality values (e.g., `*;q=0.1`)
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Encoding
+encoding! {
+    Gzip(GZIP, b"gzip"),
+    Compress(COMPRESS, b"compress"),
+    Deflate(DEFLATE, b"deflate"),
+    Br(BR, b"br"),
+    Zstd(ZSTD, b"zstd")
+}
 
 // TODO: other methods
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -51,8 +108,23 @@ pub struct Request {
 }
 
 macro_rules! status_code {
-    ($name:ident,$code:literal) => {
-        pub const $name: StatusCode = StatusCode(unsafe { NonZeroU16::new_unchecked($code) });
+    ($(($name:ident, $code:literal, $repr:literal)),+) => {
+        impl StatusCode {
+            $(
+                pub const $name: StatusCode = StatusCode(unsafe {
+                    NonZeroU16::new_unchecked($code)
+                });
+            )+
+
+            // TODO: see optimizations in hyper
+            #[inline]
+            pub fn as_str(&self) -> &str {
+                match self.as_u16() {
+                    $($code => $repr,)+
+                    code => unimplemented!("string representation of {code:?}"),
+                }
+            }
+        }
     };
 }
 
@@ -60,29 +132,18 @@ macro_rules! status_code {
 #[repr(transparent)]
 pub struct StatusCode(NonZeroU16);
 
-impl StatusCode {
-    status_code!(OK, 200);
-    status_code!(CREATED, 201);
-    status_code!(BAD_REQUEST, 400);
-    status_code!(NOT_FOUND, 404);
-    status_code!(INTERNAL_SERVER_ERROR, 500);
+status_code! {
+    (OK, 200, "OK"),
+    (CREATED, 201, "Created"),
+    (BAD_REQUEST, 400, "Bad Request"),
+    (NOT_FOUND, 404, "Not Found"),
+    (INTERNAL_SERVER_ERROR, 500, "Internal Server Error")
+}
 
+impl StatusCode {
     #[inline]
     pub fn as_u16(&self) -> u16 {
         self.0.into()
-    }
-
-    // TODO: see optimizations in hyper
-    #[inline]
-    pub fn as_str(&self) -> &str {
-        match self.as_u16() {
-            200 => "OK",
-            201 => "Created",
-            400 => "Bad Request",
-            404 => "Not Found",
-            500 => "Internal Server Error",
-            code => unimplemented!("string representation of {code:?}"),
-        }
     }
 }
 
@@ -104,10 +165,18 @@ pub struct Response {
 impl Response {
     #[inline]
     pub fn from_request(request: &Request) -> ResponseBuilder {
+        let mut headers = HashMap::with_capacity(4);
+
+        let accept_encoding = request.headers.extract::<AcceptEncoding>();
+
+        if let Some(encoding) = accept_encoding.and_then(|enc| enc.into()) {
+            headers.insert(CONTENT_ENCODING, encoding);
+        }
+
         ResponseBuilder {
             version: request.version.clone(),
             status: StatusCode::default(),
-            headers: HashMap::new(),
+            headers,
             body: BytesMut::new(),
         }
     }

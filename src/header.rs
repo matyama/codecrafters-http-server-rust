@@ -1,13 +1,80 @@
 use std::{str::FromStr, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+
+use crate::Encoding;
+
+pub const ACCEPT_ENCODING: Bytes = Bytes::from_static(b"Accept-Encoding");
 
 pub const CONTENT_TYPE: Bytes = Bytes::from_static(b"Content-Type");
 pub const CONTENT_LENGTH: Bytes = Bytes::from_static(b"Content-Length");
+pub const CONTENT_ENCODING: Bytes = Bytes::from_static(b"Content-Encoding");
 
 // TODO: enum MimeType: Into<Bytes> + FromStr
 pub const TEXT_PLAIN: Bytes = Bytes::from_static(b"text/plain");
 pub const OCTET_STREAM: Bytes = Bytes::from_static(b"application/octet-stream");
+
+pub trait ToHeaderName {
+    fn header_name() -> Bytes;
+}
+
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct AcceptEncoding(Vec<Encoding>);
+
+impl From<Bytes> for AcceptEncoding {
+    fn from(value: Bytes) -> Self {
+        let mut value = value.clone();
+
+        let mut encs = Vec::with_capacity(8);
+
+        while let Some(pos) = value.iter().position(|&b| b == b',') {
+            let enc = value.split_to(pos);
+            let _ = value.split_to(1);
+
+            // skip over whitespace
+            if let Some(at) = value.iter().position(|&b| !b.is_ascii_whitespace()) {
+                let _ = value.split_to(at);
+            }
+
+            if let Ok(enc) = Encoding::try_from(enc) {
+                encs.push(enc);
+            }
+        }
+
+        if let Ok(enc) = Encoding::try_from(value.as_ref()) {
+            encs.push(enc);
+        }
+
+        Self(encs)
+    }
+}
+
+impl ToHeaderName for AcceptEncoding {
+    #[inline]
+    fn header_name() -> Bytes {
+        ACCEPT_ENCODING
+    }
+}
+
+impl From<AcceptEncoding> for Option<Bytes> {
+    fn from(encoding: AcceptEncoding) -> Self {
+        const SEP: Bytes = Bytes::from_static(b", ");
+
+        if encoding.0.is_empty() {
+            return None;
+        }
+
+        let mut bytes = BytesMut::with_capacity(32);
+
+        let encs = encoding.0.into_iter().map(Bytes::from);
+        for enc in itertools::intersperse(encs, SEP) {
+            bytes.extend_from_slice(&enc);
+        }
+
+        Some(bytes.freeze())
+    }
+}
 
 // TODO: ideally some persistent map (immutable, with structural sharing)
 #[derive(Clone, Debug)]
@@ -36,6 +103,15 @@ impl HeaderMap {
                 None
             }
         })
+    }
+
+    #[inline]
+    pub fn extract<V>(&self) -> Option<V>
+    where
+        V: ToHeaderName,
+        Bytes: Into<V>,
+    {
+        self.get(V::header_name()).map(Into::<V>::into)
     }
 
     pub fn read<K, V>(&self, key: K) -> Option<V>

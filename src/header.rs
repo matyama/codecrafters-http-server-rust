@@ -5,7 +5,9 @@ use bytes::Bytes;
 pub const CONTENT_TYPE: Bytes = Bytes::from_static(b"Content-Type");
 pub const CONTENT_LENGTH: Bytes = Bytes::from_static(b"Content-Length");
 
+// TODO: enum MimeType: Into<Bytes> + FromStr
 pub const TEXT_PLAIN: Bytes = Bytes::from_static(b"text/plain");
+pub const OCTET_STREAM: Bytes = Bytes::from_static(b"application/octet-stream");
 
 // TODO: ideally some persistent map (immutable, with structural sharing)
 #[derive(Clone, Debug)]
@@ -60,8 +62,8 @@ pub struct HeaderMapBuilder(Vec<(Bytes, Bytes)>);
 impl HeaderMapBuilder {
     // TODO: handle duplicate headers
     #[inline]
-    pub fn insert(&mut self, name: Bytes, value: Bytes) {
-        self.0.push((name, value))
+    pub fn insert(&mut self, name: Bytes, value: impl Into<Bytes>) {
+        self.0.push((name, value.into()))
     }
 
     #[inline]

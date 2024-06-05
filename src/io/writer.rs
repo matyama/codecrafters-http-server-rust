@@ -2,8 +2,9 @@ use std::io::{Cursor, Write as _};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{self, AsyncWriteExt, BufWriter};
 
+use crate::body::Body;
 use crate::header::HeaderMap;
 use crate::io::CRLF;
 use crate::{Response, StatusCode};
@@ -50,7 +51,7 @@ where
         self.writer.write_all(CRLF).await.context("end")
     }
 
-    async fn write_haaders(&mut self, headers: HeaderMap) -> Result<()> {
+    async fn write_headers(&mut self, headers: HeaderMap) -> Result<()> {
         for (name, value) in headers.iter() {
             self.write_header(name, value).await?;
         }
@@ -62,15 +63,23 @@ where
             .await
             .context("status line")?;
 
-        self.write_haaders(response.headers)
+        self.write_headers(response.headers)
             .await
             .context("headers")?;
 
-        if !response.body.is_empty() {
-            self.writer
-                .write_all(&response.body)
-                .await
-                .context("body")?;
+        match response.body {
+            body if body.is_empty() => {}
+
+            Body::Bytes(body) => {
+                self.writer.write_all(&body).await.context("body")?;
+            }
+
+            Body::File(body) => {
+                let mut reader = body.into_reader();
+                io::copy_buf(&mut reader, &mut self.writer)
+                    .await
+                    .context("body")?;
+            }
         }
 
         self.writer.flush().await.context("flush")

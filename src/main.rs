@@ -1,11 +1,18 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 
-use http_server_starter_rust::handle_connection;
+use http_server_starter_rust::{handle_connection, Config};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let addr = "127.0.0.1:4221";
+    println!("reading server configuration");
+    let cfg = Config::from_args()
+        .map(Arc::new)
+        .context("parse program arguments")?;
+
+    let addr = cfg.listen_addr();
 
     println!("starting server at {addr}");
     let listener = TcpListener::bind(addr).await.context("bind TCP listener")?;
@@ -15,10 +22,17 @@ async fn main() -> Result<()> {
         tokio::select! {
             stream = listener.accept() => match stream {
                 Ok((stream, addr)) => {
-                    stream.set_nodelay(true)?;
-                    if let Err(error) = tokio::spawn(handle_connection(stream)).await {
-                        eprintln!("connection {addr} failed with {error}");
+                    if let Err(e) = stream.set_nodelay(true) {
+                        eprintln!("failed to enable TCP_NODELAY on connection: {e:?}");
                     }
+
+                    let cfg = Arc::clone(&cfg);
+
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_connection(stream, &cfg).await {
+                            eprintln!("connection {addr} failed with {error}");
+                        }
+                    });
                 }
                 Err(error) => eprintln!("cannot get client: {error}"),
             }

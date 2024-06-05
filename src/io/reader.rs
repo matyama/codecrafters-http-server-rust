@@ -87,7 +87,7 @@ where
 
     async fn read_body(&mut self, len: usize, buf: &mut BytesMut) -> Result<Body> {
         if len == 0 {
-            return Ok(Body::default());
+            return Ok(Body::empty());
         }
 
         buf.reserve(len);

@@ -1,57 +1,27 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use header::{CONTENT_LENGTH, CONTENT_TYPE, TEXT_PLAIN};
+use tokio::fs;
 use tokio::net::TcpStream;
 
-use crate::header::HeaderMap;
+use crate::body::Body;
+use crate::header::{HeaderMap, OCTET_STREAM};
 use crate::io::{RequestReader, ResponseWriter};
 
+pub use config::Config;
+
+pub(crate) mod body;
+pub(crate) mod config;
 pub(crate) mod header;
 pub(crate) mod io;
 
-#[derive(Clone, Debug, Default)]
-#[repr(transparent)]
-pub struct Body(Bytes);
-
-impl std::ops::Deref for Body {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<Bytes> for Body {
-    #[inline]
-    fn from(bytes: Bytes) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<BytesMut> for Body {
-    #[inline]
-    fn from(bytes: BytesMut) -> Self {
-        Self(bytes.freeze())
-    }
-}
-
-impl From<&[u8]> for Body {
-    #[inline]
-    fn from(bytes: &[u8]) -> Self {
-        if bytes.is_empty() {
-            Self::default()
-        } else {
-            Self::from(Bytes::copy_from_slice(bytes))
-        }
-    }
-}
-
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Request {
     // TODO: method as an enum
     method: Bytes,
@@ -68,6 +38,8 @@ pub struct StatusCode(NonZeroU16);
 impl StatusCode {
     pub const OK: StatusCode = StatusCode(unsafe { NonZeroU16::new_unchecked(200) });
     pub const NOT_FOUND: StatusCode = StatusCode(unsafe { NonZeroU16::new_unchecked(404) });
+    pub const INTERNAL_SERVER_ERROR: StatusCode =
+        StatusCode(unsafe { NonZeroU16::new_unchecked(500) });
 
     #[inline]
     pub fn as_u16(&self) -> u16 {
@@ -80,6 +52,7 @@ impl StatusCode {
         match self.as_u16() {
             200 => "OK",
             404 => "Not Found",
+            500 => "Internal Server Error",
             code => unimplemented!("string representation of {code:?}"),
         }
     }
@@ -92,7 +65,7 @@ impl Default for StatusCode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Response {
     pub(crate) version: Bytes,
     pub(crate) status: StatusCode,
@@ -139,7 +112,7 @@ impl ResponseBuilder {
         body: Body,
     ) -> Response {
         // insert/overwrite with the final content length
-        let content_length = match body.len() {
+        let content_length = match body.content_length() {
             0 => Bytes::from_static(b"0"),
             len => len.to_string().into(),
         };
@@ -154,9 +127,36 @@ impl ResponseBuilder {
     }
 
     #[inline]
-    pub fn text_plain(mut self, body: impl Into<Body>) -> Response {
+    pub fn empty(self) -> Response {
+        self.plain(Body::empty())
+    }
+
+    #[inline]
+    pub fn plain(mut self, body: impl Into<Body>) -> Response {
         self = self.header(CONTENT_TYPE, TEXT_PLAIN);
         Self::build_response(self.version, self.status, self.headers, body.into())
+    }
+
+    pub async fn file(mut self, path: PathBuf) -> Response {
+        let file = match fs::OpenOptions::new().read(true).open(path).await {
+            Ok(file) => file,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                return self.status(StatusCode::NOT_FOUND).empty()
+            }
+            Err(_) => return self.status(StatusCode::INTERNAL_SERVER_ERROR).empty(),
+        };
+
+        let body = match Body::file(file).await {
+            Ok(body) => body,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                return self.status(StatusCode::NOT_FOUND).empty()
+            }
+            Err(_) => return self.status(StatusCode::INTERNAL_SERVER_ERROR).empty(),
+        };
+
+        self = self.header(CONTENT_TYPE, OCTET_STREAM);
+
+        Self::build_response(self.version, self.status, self.headers, body)
     }
 
     #[inline]
@@ -166,7 +166,7 @@ impl ResponseBuilder {
 }
 
 /// Handle a HTTP/1.1 client connection
-pub async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+pub async fn handle_connection(mut stream: TcpStream, cfg: &Config) -> Result<()> {
     let (reader, writer) = stream.split();
     let mut reader = RequestReader::new(reader);
     let mut writer = ResponseWriter::new(writer);
@@ -188,16 +188,35 @@ pub async fn handle_connection(mut stream: TcpStream) -> Result<()> {
             |user_agent| {
                 Response::from_request(&req)
                     .status(StatusCode::OK)
-                    .text_plain(user_agent)
+                    .plain(user_agent)
             },
         ),
+
+        url if url.starts_with(b"/files/") => {
+            let file = url
+                .strip_prefix(b"/files/")
+                .and_then(|f| std::str::from_utf8(f).map(Path::new).ok())
+                .map(|f| cfg.files_dir().join(f));
+
+            match file {
+                Some(file) if file.exists() && file.is_file() => {
+                    Response::from_request(&req)
+                        .status(StatusCode::OK)
+                        .file(file)
+                        .await
+                }
+                _ => Response::from_request(&req)
+                    .status(StatusCode::NOT_FOUND)
+                    .build(),
+            }
+        }
 
         url if url.starts_with(b"/echo") => {
             let msg = url.strip_prefix(b"/echo/").unwrap_or_default();
 
             Response::from_request(&req)
                 .status(StatusCode::OK)
-                .text_plain(msg)
+                .plain(msg)
         }
 
         _ => Response::from_request(&req)

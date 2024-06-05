@@ -179,6 +179,19 @@ pub async fn handle_connection(mut stream: TcpStream) -> Result<()> {
     let resp = match req.target.as_ref() {
         b"/" => Response::from_request(&req).status(StatusCode::OK).build(),
 
+        b"/user-agent" | b"/user-agent/" => req.headers.get(b"user-agent").map_or_else(
+            || {
+                Response::from_request(&req)
+                    .status(StatusCode::NOT_FOUND)
+                    .build()
+            },
+            |user_agent| {
+                Response::from_request(&req)
+                    .status(StatusCode::OK)
+                    .text_plain(user_agent)
+            },
+        ),
+
         url if url.starts_with(b"/echo") => {
             let msg = url.strip_prefix(b"/echo/").unwrap_or_default();
 

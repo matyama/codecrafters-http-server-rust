@@ -28,8 +28,7 @@ impl HeaderMap {
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Bytes> {
         let key = key.as_ref();
         self.0.iter().find_map(|(name, value)| {
-            // FIXME: header name is case-insensitive
-            if name.as_ref() == key {
+            if name.matches(key) {
                 Some(value.clone())
             } else {
                 None
@@ -68,5 +67,46 @@ impl HeaderMapBuilder {
     #[inline]
     pub fn build(self) -> HeaderMap {
         HeaderMap(Arc::from(self.0.into_boxed_slice()))
+    }
+}
+
+const CASE_SHIFT: u8 = b'a'.abs_diff(b'A');
+
+pub(crate) fn compare<F, D, T>(cmp: F, data: D, target: T) -> bool
+where
+    F: Fn(u8, u8) -> bool,
+    D: AsRef<[u8]>,
+    T: AsRef<[u8]>,
+{
+    let data = data.as_ref();
+    let target = target.as_ref();
+
+    if data.len() != target.len() {
+        return false;
+    }
+
+    data.iter().zip(target.iter()).all(|(&x, &y)| cmp(x, y))
+}
+
+fn ignore_case_eq(x: u8, y: u8) -> bool {
+    x == y || (x.is_ascii_alphabetic() && y.is_ascii_alphabetic() && x.abs_diff(y) == CASE_SHIFT)
+}
+
+trait BytesExt {
+    /// Returns `true` iff `self` matches given target ignoring casing of ASCII (alpha) characters
+    fn matches(&self, target: impl AsRef<[u8]>) -> bool;
+}
+
+impl<'a> BytesExt for &'a [u8] {
+    #[inline]
+    fn matches(&self, target: impl AsRef<[u8]>) -> bool {
+        compare(ignore_case_eq, self, target)
+    }
+}
+
+impl BytesExt for Bytes {
+    #[inline]
+    fn matches(&self, target: impl AsRef<[u8]>) -> bool {
+        compare(ignore_case_eq, self, target)
     }
 }

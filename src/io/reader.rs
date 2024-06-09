@@ -81,7 +81,7 @@ where
         let mut headers = HeaderMap::builder();
 
         while let Some((name, value)) = self.read_header(buf).await? {
-            headers.insert(name, value);
+            headers.assoc(name, value);
         }
 
         Ok(headers.build())

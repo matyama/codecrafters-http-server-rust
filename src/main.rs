@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use itertools::Itertools;
 use tokio::net::TcpListener;
 
 use http_server_starter_rust::{handle_connection, Config};
@@ -11,6 +12,9 @@ async fn main() -> Result<()> {
     let cfg = Config::from_args()
         .map(Arc::new)
         .context("parse program arguments")?;
+
+    let encs = Config::encodings().iter().join(", ");
+    println!("supported encodings: {encs}");
 
     let addr = cfg.listen_addr();
 

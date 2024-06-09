@@ -1,8 +1,10 @@
-use std::{str::FromStr, sync::Arc};
+use std::collections::HashSet;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::Encoding;
+use crate::encoding::{Encoding, SystemEncoder};
 
 pub const ACCEPT_ENCODING: Bytes = Bytes::from_static(b"Accept-Encoding");
 
@@ -18,9 +20,20 @@ pub trait ToHeaderName {
     fn header_name() -> Bytes;
 }
 
+pub trait IntoHeaderValue {
+    fn into_header_value(self) -> Bytes;
+}
+
 #[derive(Debug, Default)]
 #[repr(transparent)]
 pub struct AcceptEncoding(Vec<Encoding>);
+
+impl AcceptEncoding {
+    #[inline]
+    pub(crate) fn select(&self, supported: &HashSet<Encoding>) -> Option<Encoding> {
+        self.0.iter().find(|enc| supported.contains(enc)).copied()
+    }
+}
 
 impl From<Bytes> for AcceptEncoding {
     fn from(value: Bytes) -> Self {
@@ -76,6 +89,94 @@ impl From<AcceptEncoding> for Option<Bytes> {
     }
 }
 
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ContentEncoding(Encoding);
+
+impl std::fmt::Display for ContentEncoding {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl ToHeaderName for ContentEncoding {
+    #[inline]
+    fn header_name() -> Bytes {
+        CONTENT_ENCODING
+    }
+}
+
+impl IntoHeaderValue for ContentEncoding {
+    #[inline]
+    fn into_header_value(self) -> Bytes {
+        self.0.into()
+    }
+}
+
+impl TryFrom<Bytes> for ContentEncoding {
+    type Error = anyhow::Error;
+
+    #[inline]
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        Encoding::try_from(bytes).map(Self)
+    }
+}
+
+impl SystemEncoder for ContentEncoding {
+    #[inline]
+    fn program(&self) -> Option<&str> {
+        self.0.program()
+    }
+
+    #[inline]
+    fn command(&self) -> Option<tokio::process::Command> {
+        self.0.command()
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ContentLength(Bytes);
+
+impl ToHeaderName for ContentLength {
+    #[inline]
+    fn header_name() -> Bytes {
+        CONTENT_LENGTH
+    }
+}
+
+impl IntoHeaderValue for ContentLength {
+    #[inline]
+    fn into_header_value(self) -> Bytes {
+        self.0
+    }
+}
+
+impl From<Bytes> for ContentLength {
+    #[inline]
+    fn from(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<u64> for ContentLength {
+    #[inline]
+    fn from(len: u64) -> Self {
+        Self(match len {
+            0 => Bytes::from_static(b"0"),
+            len => len.to_string().into(),
+        })
+    }
+}
+
+impl From<ContentLength> for Bytes {
+    #[inline]
+    fn from(ContentLength(len): ContentLength) -> Self {
+        len
+    }
+}
+
 // TODO: ideally some persistent map (immutable, with structural sharing)
 #[derive(Clone, Debug)]
 #[repr(transparent)]
@@ -109,9 +210,9 @@ impl HeaderMap {
     pub fn extract<V>(&self) -> Option<V>
     where
         V: ToHeaderName,
-        Bytes: Into<V>,
+        Bytes: TryInto<V>,
     {
-        self.get(V::header_name()).map(Into::<V>::into)
+        self.get(V::header_name()).and_then(|v| v.try_into().ok())
     }
 
     pub fn read<K, V>(&self, key: K) -> Option<V>
@@ -123,6 +224,29 @@ impl HeaderMap {
         std::str::from_utf8(&value)
             .ok()
             .and_then(|value| value.parse().ok())
+    }
+
+    #[inline]
+    pub fn insert<H: ToHeaderName + IntoHeaderValue>(&self, header: H) -> Self {
+        self.assoc(H::header_name(), header.into_header_value())
+    }
+
+    // NOTE: here we'd really benefit from a persistent data structure with structural sharing
+    pub fn assoc<K, V>(&self, key: K, val: V) -> Self
+    where
+        K: Into<Bytes>,
+        V: Into<Bytes>,
+    {
+        let key = key.into();
+        let val = val.into();
+
+        Self::from_iter(self.iter().map(|(k, v)| {
+            if k.matches(&key) {
+                (key.clone(), val.clone())
+            } else {
+                (k, v)
+            }
+        }))
     }
 
     #[inline]
@@ -138,8 +262,12 @@ pub struct HeaderMapBuilder(Vec<(Bytes, Bytes)>);
 impl HeaderMapBuilder {
     // TODO: handle duplicate headers
     #[inline]
-    pub fn insert(&mut self, name: Bytes, value: impl Into<Bytes>) {
+    pub fn assoc(&mut self, name: Bytes, value: impl Into<Bytes>) {
         self.0.push((name, value.into()))
+    }
+
+    pub fn insert<H: ToHeaderName + IntoHeaderValue>(&mut self, header: H) {
+        self.assoc(H::header_name(), header.into_header_value())
     }
 
     #[inline]

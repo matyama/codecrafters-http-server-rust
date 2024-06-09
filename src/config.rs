@@ -1,8 +1,12 @@
+use std::collections::HashSet;
 use std::env::Args;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context as _, Result};
+
+use crate::encoding::{self, Encoding};
 
 fn listen_socket_addr(port: &impl std::fmt::Display) -> Result<SocketAddr> {
     format!("0.0.0.0:{port}")
@@ -30,6 +34,15 @@ impl Config {
     #[inline]
     pub fn files_dir(&self) -> &Path {
         self.dir.as_path()
+    }
+
+    #[inline]
+    pub fn encodings() -> &'static HashSet<Encoding> {
+        // NOTE: Normally, this would not be necessary, but here we depend on external programs.
+        static SUPPORTED: OnceLock<HashSet<Encoding>> = OnceLock::new();
+        SUPPORTED.get_or_init(|| {
+            encoding::get_supported().expect("query available compression programs")
+        })
     }
 }
 

@@ -60,6 +60,8 @@ where
     }
 
     pub async fn write_response(&mut self, response: Response) -> Result<()> {
+        let response = response.compress().await;
+
         self.write_status_line(response.status, response.version)
             .await
             .context("status line")?;
@@ -77,7 +79,7 @@ where
 
             Body::File(body) => {
                 let mut reader = body.into_reader();
-                io::copy_buf(&mut reader, &mut self.writer)
+                io::copy(&mut reader, &mut self.writer)
                     .await
                     .context("body")?;
             }
@@ -104,7 +106,7 @@ impl FileWriter {
             }
             Body::File(file) => {
                 let mut reader = file.into_reader();
-                io::copy_buf(&mut reader, &mut self.0).await?
+                io::copy(&mut reader, &mut self.0).await?
             }
         };
 

@@ -1,19 +1,30 @@
+use std::ffi::OsStr;
 use std::fs::Metadata;
+use std::path::PathBuf;
 
 use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
-use tokio::io::{AsyncBufRead, BufReader};
+use tokio::io::AsyncRead;
+
+use crate::header::ContentLength;
 
 #[derive(Debug)]
 pub struct FileBody {
+    path: PathBuf,
     file: File,
     meta: Metadata,
 }
 
 impl FileBody {
+    // NOTE: files are already buffered
     #[inline]
-    pub fn into_reader(self) -> impl AsyncBufRead + Unpin {
-        BufReader::new(self.file)
+    pub fn into_reader(self) -> impl AsyncRead + Unpin {
+        self.file
+    }
+
+    #[inline]
+    pub(crate) fn as_path(&self) -> &OsStr {
+        self.path.as_os_str()
     }
 }
 
@@ -29,22 +40,32 @@ impl Body {
         Self::Bytes(Bytes::default())
     }
 
-    pub async fn file(file: File) -> std::io::Result<Self> {
+    #[inline]
+    pub fn bytes(bytes: impl Into<Bytes>) -> Self {
+        Self::Bytes(bytes.into())
+    }
+
+    pub async fn file(path: PathBuf, file: File) -> std::io::Result<Self> {
         let meta = file.metadata().await?;
-        Ok(Self::from(FileBody { file, meta }))
+        Ok(Self::from(FileBody { path, file, meta }))
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.content_length() == 0
+        self.len() == 0
     }
 
     #[inline]
-    pub fn content_length(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         match self {
             Body::Bytes(bytes) => bytes.len() as u64,
             Body::File(file) => file.meta.len(),
         }
+    }
+
+    #[inline]
+    pub fn content_length(&self) -> ContentLength {
+        ContentLength::from(self.len())
     }
 }
 

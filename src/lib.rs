@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use header::{CONTENT_LENGTH, CONTENT_TYPE, TEXT_PLAIN};
+use encoding::SystemEncoder;
+use header::{
+    ContentEncoding, ContentLength, HeaderMapBuilder, ToHeaderName, CONTENT_TYPE, TEXT_PLAIN,
+};
 use tokio::fs;
 use tokio::net::TcpStream;
 
@@ -17,84 +20,40 @@ pub use config::Config;
 
 pub(crate) mod body;
 pub(crate) mod config;
+pub(crate) mod encoding;
 pub(crate) mod header;
 pub(crate) mod io;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Encoding {
-    Gzip,
-    Compress,
-    Deflate,
-    Br,
-    Zstd,
-}
-
-macro_rules! encoding {
-    ($($var:ident($name:ident, $enc:literal)),+) => {
-        impl Encoding {
-            $(pub const $name: Bytes = Bytes::from_static($enc);)+
-        }
-
-        impl TryFrom<&[u8]> for Encoding {
-            type Error = anyhow::Error;
-
-            #[inline]
-            fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-                match bytes {
-                    $($enc => Ok(Self::$var),)+
-                    other => bail!("unsupported encoding '{}'", String::from_utf8_lossy(other)),
-                }
-            }
-        }
-
-        impl From<Encoding> for Bytes {
-            #[inline]
-            fn from(encoding: Encoding) -> Self {
-                match encoding {
-                    $(Encoding::$var => Encoding::$name,)+
-                }
-            }
-        }
-    };
-}
-
-impl TryFrom<Bytes> for Encoding {
-    type Error = anyhow::Error;
-
-    #[inline]
-    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
-        Self::try_from(bytes.as_ref())
-    }
-}
-
-// TODO: support * and quality values (e.g., `*;q=0.1`)
-// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Encoding
-encoding! {
-    Gzip(GZIP, b"gzip"),
-    Compress(COMPRESS, b"compress"),
-    Deflate(DEFLATE, b"deflate"),
-    Br(BR, b"br"),
-    Zstd(ZSTD, b"zstd")
-}
-
-// TODO: other methods
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Method {
     Get,
     Post,
 }
 
-impl TryFrom<Bytes> for Method {
-    type Error = anyhow::Error;
-
-    #[inline]
-    fn try_from(method: Bytes) -> Result<Self, Self::Error> {
-        match method.as_ref() {
-            b"GET" => Ok(Self::Get),
-            b"POST" => Ok(Self::Post),
-            _ => bail!("unknown method '{}'", String::from_utf8_lossy(&method)),
+macro_rules! method {
+    ($(($method:ident, $name:ident, $enc:literal)),+) => {
+        impl Method {
+            $(pub const $name: Bytes = Bytes::from_static($enc);)+
         }
-    }
+
+        impl TryFrom<Bytes> for Method {
+            type Error = anyhow::Error;
+
+            #[inline]
+            fn try_from(method: Bytes) -> Result<Self, Self::Error> {
+                match method.as_ref() {
+                    $($enc => Ok(Self::$method),)+
+                    _ => bail!("unknown method '{}'", String::from_utf8_lossy(&method)),
+                }
+            }
+        }
+    };
+}
+
+// TODO: other methods
+method! {
+    (Get, GET, b"GET"),
+    (Post, POST, b"POST")
 }
 
 #[allow(dead_code)]
@@ -168,8 +127,13 @@ impl Response {
         let mut headers = HashMap::with_capacity(4);
 
         let accept_encoding = request.headers.extract::<AcceptEncoding>();
+        let supported = Config::encodings();
 
-        if let Some(encoding) = accept_encoding.and_then(|enc| enc.into()) {
+        let content_encoding = accept_encoding
+            .and_then(|enc| enc.select(supported))
+            .map(Bytes::from);
+
+        if let Some(encoding) = content_encoding {
             headers.insert(CONTENT_ENCODING, encoding);
         }
 
@@ -179,6 +143,43 @@ impl Response {
             headers,
             body: BytesMut::new(),
         }
+    }
+
+    /// Compress body based on `Content-Encoding` header.
+    ///
+    /// Returns
+    ///  - Original response if no Content-Encoding was given in headers
+    ///  - Response with (`Byte`) body encoded by the `Content-Encoding` algorithm
+    ///  - Internal Server Error response with a plain text body with a compression error
+    pub async fn compress(self) -> Self {
+        let Some(content_encoding) = self.headers.extract::<ContentEncoding>() else {
+            return self;
+        };
+
+        let version = self.version.clone();
+
+        content_encoding.compress(self.body).await.map_or_else(
+            |error| {
+                let body = Body::bytes(error.to_string());
+
+                let mut headers = HeaderMapBuilder::default();
+                headers.assoc(CONTENT_TYPE, TEXT_PLAIN);
+                headers.insert(body.content_length());
+
+                Response {
+                    version,
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    headers: headers.build(),
+                    body,
+                }
+            },
+            |body| Response {
+                version: self.version,
+                status: self.status,
+                headers: self.headers.insert(body.content_length()),
+                body,
+            },
+        )
     }
 }
 
@@ -209,11 +210,8 @@ impl ResponseBuilder {
         body: Body,
     ) -> Response {
         // insert/overwrite with the final content length
-        let content_length = match body.content_length() {
-            0 => Bytes::from_static(b"0"),
-            len => len.to_string().into(),
-        };
-        headers.insert(CONTENT_LENGTH, content_length);
+        let content_length = body.content_length();
+        headers.insert(ContentLength::header_name(), content_length.into());
 
         Response {
             version,
@@ -235,7 +233,7 @@ impl ResponseBuilder {
     }
 
     pub async fn file(mut self, path: PathBuf) -> Response {
-        let file = match fs::OpenOptions::new().read(true).open(path).await {
+        let file = match fs::OpenOptions::new().read(true).open(path.as_path()).await {
             Ok(file) => file,
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
                 return self.status(StatusCode::NOT_FOUND).empty()
@@ -243,7 +241,7 @@ impl ResponseBuilder {
             Err(_) => return self.status(StatusCode::INTERNAL_SERVER_ERROR).empty(),
         };
 
-        let body = match Body::file(file).await {
+        let body = match Body::file(path, file).await {
             Ok(body) => body,
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
                 return self.status(StatusCode::NOT_FOUND).empty()
@@ -349,7 +347,7 @@ async fn upload_file(file: PathBuf, req: Request) -> Response {
         Err(_) => return resp.status(StatusCode::INTERNAL_SERVER_ERROR).empty(),
     };
 
-    let bytes_read = req.body.content_length();
+    let bytes_read = req.body.len();
 
     // TODO: stream body from the request based on Content-Type (i.e., don't materialize in memory)
     let Ok(bytes_written) = file.write(req.body).await else {
